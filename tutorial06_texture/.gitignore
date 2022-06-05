@@ -1,1 +1,3 @@
-app/src/main/cpp/shaderc
+local.properties
+.idea
+.gradle
