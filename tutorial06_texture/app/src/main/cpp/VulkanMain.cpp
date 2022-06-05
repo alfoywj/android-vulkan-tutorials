@@ -43,7 +43,9 @@ static const char* kTAG = "Vulkan-Tutorial06";
 // A macro to check value is VK_SUCCESS
 // Used also for non-vulkan functions but return VK_SUCCESS
 #define VK_CHECK(x) CALL_VK(x)
-
+VkResult AllocateMemoryTypeFromProperties(uint32_t typeBits,
+                                          VkFlags requirements_mask,
+                                          uint32_t* typeIndex);
 // Global Variables ...
 struct VulkanDeviceInfo {
   bool initialized_;
@@ -54,8 +56,450 @@ struct VulkanDeviceInfo {
   VkDevice device_;
   uint32_t queueFamilyIndex_;
 
-  VkSurfaceKHR surface_;
-  VkQueue queue_;
+    VkSurfaceKHR surface_;
+    VkQueue queue_;
+};
+#include <array>
+android_app* androidAppCtx = nullptr;
+struct OffScreen {
+    OffScreen(VulkanDeviceInfo vulkanDeviceInfo) {
+      mDevice = vulkanDeviceInfo;
+      prepareOffScreen();
+      buildCommandBuffers();
+    }
+    VulkanDeviceInfo mDevice{VK_NULL_HANDLE};
+
+    uint32_t width = 1024;
+    uint32_t height = 1024;
+    VkExtent2D size{1024,1024};
+
+    VkImage imageColor{VK_NULL_HANDLE};
+    VkFormat fbColorFormat = VK_FORMAT_R8G8B8A8_UNORM;
+    VkDeviceMemory memColor{VK_NULL_HANDLE};
+    VkImageView viewColor{VK_NULL_HANDLE};
+
+    VkImage imageDepth{VK_NULL_HANDLE};
+    VkFormat fbDepthFormat = VK_FORMAT_D32_SFLOAT;
+    VkDeviceMemory memDepth{VK_NULL_HANDLE};
+    VkImageView viewDepth{VK_NULL_HANDLE};
+
+    VkRenderPass renderPass{VK_NULL_HANDLE};
+    VkFramebuffer mFramebuffer{VK_NULL_HANDLE};
+
+    VkPipelineLayout layout;
+
+    VkPipeline pipe{VK_NULL_HANDLE};
+    VkPrimitiveTopology topology{VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST};
+    VkDescriptorImageInfo descriptorInfo{};
+    VkSampler sampler;
+    void buildCommandBuffers()
+    {
+      VkCommandPool cmdPool;
+      VkCommandBuffer gfxCmd;
+      {
+        VkCommandPoolCreateInfo cmdPoolCreateInfo{
+                .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+                .pNext = nullptr,
+                .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+                .queueFamilyIndex = 0,
+        };
+        CALL_VK(vkCreateCommandPool(mDevice.device_, &cmdPoolCreateInfo, nullptr, &cmdPool));
+
+
+        const VkCommandBufferAllocateInfo cmd = {
+                .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+                .pNext = nullptr,
+                .commandPool = cmdPool,
+                .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+                .commandBufferCount = 1,
+        };
+
+        CALL_VK(vkAllocateCommandBuffers(mDevice.device_, &cmd, &gfxCmd));
+        VkCommandBufferBeginInfo cmd_buf_info = {
+                .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                .pNext = nullptr,
+                .flags = 0,
+                .pInheritanceInfo = nullptr};
+        CALL_VK(vkBeginCommandBuffer(gfxCmd, &cmd_buf_info));
+      }
+      {
+        // Bind and clear eye render target
+        static float darkSlateGrey[4] = {0.184313729f, 0.309803933f, 0.309803933f, 1.0f};
+        static std::array<VkClearValue, 2> clearValues;
+        clearValues[0].color.float32[0] = darkSlateGrey[0];
+        clearValues[0].color.float32[1] = darkSlateGrey[1];
+        clearValues[0].color.float32[2] = darkSlateGrey[2];
+        clearValues[0].color.float32[3] = darkSlateGrey[3];
+        clearValues[1].depthStencil.depth = 1.0f;
+        clearValues[1].depthStencil.stencil = 0;
+        VkRenderPassBeginInfo renderPassBeginInfo{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+        renderPassBeginInfo.clearValueCount = (uint32_t)clearValues.size();
+        renderPassBeginInfo.pClearValues = clearValues.data();
+        renderPassBeginInfo.renderPass = renderPass;
+        renderPassBeginInfo.framebuffer = mFramebuffer;
+        renderPassBeginInfo.renderArea.offset = {0, 0};
+        renderPassBeginInfo.renderArea.extent = size;
+
+        vkCmdBeginRenderPass(gfxCmd, &renderPassBeginInfo, VK_SUBPASS_CONTENTS_INLINE);
+        vkCmdBindPipeline(gfxCmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+        vkCmdEndRenderPass(gfxCmd);
+        vkEndCommandBuffer(gfxCmd);
+      }
+      {
+        VkFence fence;
+        VkFenceCreateInfo fenceCreateInfo{
+                .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+                .pNext = nullptr,
+                .flags = 0,
+        };
+        CALL_VK(vkCreateFence(mDevice.device_, &fenceCreateInfo, nullptr, &fence));
+        VkSubmitInfo submitInfo = {
+                .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                .pNext = nullptr,
+                .waitSemaphoreCount = 0,
+                .pWaitSemaphores = nullptr,
+                .pWaitDstStageMask = nullptr,
+                .commandBufferCount = 1,
+                .pCommandBuffers = &gfxCmd,
+                .signalSemaphoreCount = 0,
+                .pSignalSemaphores = nullptr,
+        };
+        CALL_VK(vkQueueSubmit(mDevice.queue_, 1, &submitInfo, fence) != VK_SUCCESS);
+        CALL_VK(vkWaitForFences(mDevice.device_, 1, &fence, VK_TRUE, 100000000) !=
+                VK_SUCCESS);
+        vkDestroyFence(mDevice.device_, fence, nullptr);
+        vkFreeCommandBuffers(mDevice.device_, cmdPool, 1, &gfxCmd);
+        vkDestroyCommandPool(mDevice.device_, cmdPool, nullptr);
+      }
+
+    }
+    // 프레임버퍼를 레드로 클리어한번 클리어한후 프레임버퍼로 저장
+    // 그걸 디스크립터로 넘겨서 화면에 보여줌.
+    void prepareOffScreen(void) {
+      {
+        VkSubpassDescription subpass = {};
+        subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+
+        VkAttachmentReference colorRef = {0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+        VkAttachmentReference depthRef = {1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
+        std::array<VkAttachmentDescription, 2> at = {};
+        VkRenderPassCreateInfo rpInfo{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+        rpInfo.attachmentCount = 0;
+        rpInfo.pAttachments = at.data();
+        rpInfo.subpassCount = 1;
+        rpInfo.pSubpasses = &subpass;
+
+        {
+          colorRef.attachment = rpInfo.attachmentCount++;
+
+          at[colorRef.attachment].format = fbColorFormat;
+          at[colorRef.attachment].samples = VK_SAMPLE_COUNT_1_BIT;
+          at[colorRef.attachment].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+          at[colorRef.attachment].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+          at[colorRef.attachment].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+          at[colorRef.attachment].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+          at[colorRef.attachment].initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+          at[colorRef.attachment].finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+          subpass.colorAttachmentCount = 1;
+          subpass.pColorAttachments = &colorRef;
+        }
+
+        {
+          depthRef.attachment = rpInfo.attachmentCount++;
+
+          at[depthRef.attachment].format = fbDepthFormat;
+          at[depthRef.attachment].samples = VK_SAMPLE_COUNT_1_BIT;
+          at[depthRef.attachment].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+          at[depthRef.attachment].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+          at[depthRef.attachment].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+          at[depthRef.attachment].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+          at[depthRef.attachment].initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+          at[depthRef.attachment].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+
+          subpass.pDepthStencilAttachment = &depthRef;
+        }
+        VK_CHECK(vkCreateRenderPass(mDevice.device_, &rpInfo, nullptr, &renderPass));
+      }
+      //color image
+      {
+        VkImageCreateInfo vkImageCreateInfo{
+                .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+                .pNext = nullptr,
+                .flags = 0,
+                .imageType = VK_IMAGE_TYPE_2D,
+                .format = fbColorFormat,
+                .extent = {static_cast<uint32_t>(width),
+                           static_cast<uint32_t>(height), 1},
+                .mipLevels = 1,
+                .arrayLayers = 1,
+                .samples = VK_SAMPLE_COUNT_1_BIT,
+                .tiling = VK_IMAGE_TILING_LINEAR,
+                .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+                .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+                .queueFamilyIndexCount = 1,
+                .pQueueFamilyIndices = &mDevice.queueFamilyIndex_,
+                .initialLayout = VK_IMAGE_LAYOUT_PREINITIALIZED
+        };
+        VK_CHECK(vkCreateImage(mDevice.device_, &vkImageCreateInfo, nullptr, &imageColor));
+        VkMemoryRequirements memReqs;
+        vkGetImageMemoryRequirements(mDevice.device_, imageColor, &memReqs);
+
+        VkMemoryAllocateInfo vkMemoryAllocateInfo = {
+                .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                .pNext = nullptr,
+                .allocationSize = memReqs.size,
+                .memoryTypeIndex = 0,
+        };
+        VK_CHECK(AllocateMemoryTypeFromProperties(memReqs.memoryTypeBits,
+                                                  VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                                                  &vkMemoryAllocateInfo.memoryTypeIndex));
+        CALL_VK(vkAllocateMemory(mDevice.device_, &vkMemoryAllocateInfo, nullptr, &memColor));
+        CALL_VK(vkBindImageMemory(mDevice.device_, imageColor, memColor, 0));
+
+        VkImageViewCreateInfo viewCreateInfo = {
+                .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+                .pNext = nullptr,
+                .flags = 0,
+                .image = imageColor,
+                .viewType = VK_IMAGE_VIEW_TYPE_2D,
+                .format = fbColorFormat,
+                .components =
+                        {
+                                .r = VK_COMPONENT_SWIZZLE_R,
+                                .g = VK_COMPONENT_SWIZZLE_G,
+                                .b = VK_COMPONENT_SWIZZLE_B,
+                                .a = VK_COMPONENT_SWIZZLE_A,
+                        },
+                .subresourceRange =
+                        {
+                                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                                .baseMipLevel = 0,
+                                .levelCount = 1,
+                                .baseArrayLayer = 0,
+                                .layerCount = 1,
+                        },
+        };
+        CALL_VK(vkCreateImageView(mDevice.device_, &viewCreateInfo, nullptr, &viewColor));
+      }
+      //depth image
+      {
+        VkImageCreateInfo vkImageCreateInfo{
+                .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+                .pNext = nullptr,
+                .flags = 0,
+                .imageType = VK_IMAGE_TYPE_2D,
+                .format = fbDepthFormat,
+                .extent = {static_cast<uint32_t>(width),
+                           static_cast<uint32_t>(height), 1},
+                .mipLevels = 1,
+                .arrayLayers = 1,
+                .samples = VK_SAMPLE_COUNT_1_BIT,
+                .tiling = VK_IMAGE_TILING_LINEAR,
+                .usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+                .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+                .queueFamilyIndexCount = 1,
+                .pQueueFamilyIndices = &mDevice.queueFamilyIndex_,
+                .initialLayout = VK_IMAGE_LAYOUT_PREINITIALIZED
+        };
+        VK_CHECK(vkCreateImage(mDevice.device_, &vkImageCreateInfo, nullptr, &imageDepth));
+        VkMemoryRequirements memReqs;
+        vkGetImageMemoryRequirements(mDevice.device_, imageDepth, &memReqs);
+
+        VkMemoryAllocateInfo vkMemoryAllocateInfo = {
+                .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                .pNext = nullptr,
+                .allocationSize = memReqs.size,
+                .memoryTypeIndex = 0,
+        };
+        VK_CHECK(AllocateMemoryTypeFromProperties(memReqs.memoryTypeBits,
+                                                  VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                                                  &vkMemoryAllocateInfo.memoryTypeIndex));
+        CALL_VK(vkAllocateMemory(mDevice.device_, &vkMemoryAllocateInfo, nullptr, &memDepth));
+        CALL_VK(vkBindImageMemory(mDevice.device_, imageDepth, memDepth, 0));
+
+        VkImageViewCreateInfo viewCreateInfo = {
+                .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+                .pNext = nullptr,
+                .flags = 0,
+                .image = imageDepth,
+                .viewType = VK_IMAGE_VIEW_TYPE_2D,
+                .format = fbDepthFormat,
+                .components =
+                        {
+                                .r = VK_COMPONENT_SWIZZLE_R,
+                                .g = VK_COMPONENT_SWIZZLE_G,
+                                .b = VK_COMPONENT_SWIZZLE_B,
+                                .a = VK_COMPONENT_SWIZZLE_A,
+                        },
+                .subresourceRange =
+                        {
+                                .aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT |
+                                              VK_IMAGE_ASPECT_STENCIL_BIT,
+                                .baseMipLevel = 0,
+                                .levelCount = 1,
+                                .baseArrayLayer = 0,
+                                .layerCount = 1,
+                        },
+        };
+        CALL_VK(vkCreateImageView(mDevice.device_, &viewCreateInfo, nullptr, &viewDepth));
+        {
+          std::array<VkImageView, 2> attachments{};
+          attachments[0] = viewColor;
+          attachments[1] = viewDepth;
+
+          VkFramebufferCreateInfo fbInfo{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+          fbInfo.renderPass = renderPass;
+          fbInfo.attachmentCount = attachments.size();
+          fbInfo.pAttachments = attachments.data();
+          fbInfo.width = width;
+          fbInfo.height = height;
+          fbInfo.layers = 1;
+          CALL_VK(vkCreateFramebuffer(mDevice.device_, &fbInfo, nullptr, &mFramebuffer));
+        }
+      }
+      //PipelineLayout
+      {
+        VkPipelineLayoutCreateInfo pipelineLayoutCreateInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        CALL_VK(vkCreatePipelineLayout(mDevice.device_, &pipelineLayoutCreateInfo, nullptr, &layout));
+      }
+      //Pipeline
+      {
+        VkPipelineDynamicStateCreateInfo dynamicState{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+        VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+        VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+        ia.topology = topology;
+        ia.primitiveRestartEnable = VK_FALSE;
+
+        VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+        rs.polygonMode = VK_POLYGON_MODE_FILL;
+        rs.cullMode = VK_CULL_MODE_BACK_BIT;
+        rs.frontFace = VK_FRONT_FACE_CLOCKWISE;
+        rs.depthClampEnable = VK_FALSE;
+        rs.rasterizerDiscardEnable = VK_FALSE;
+        rs.depthBiasEnable = VK_FALSE;
+        rs.depthBiasConstantFactor = 0;
+        rs.depthBiasClamp = 0;
+        rs.depthBiasSlopeFactor = 0;
+        rs.lineWidth = 1.0f;
+
+        VkPipelineColorBlendAttachmentState attachState{};
+        attachState.blendEnable = 0;
+        attachState.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
+        attachState.dstColorBlendFactor = VK_BLEND_FACTOR_ZERO;
+        attachState.colorBlendOp = VK_BLEND_OP_ADD;
+        attachState.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+        attachState.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+        attachState.alphaBlendOp = VK_BLEND_OP_ADD;
+        attachState.colorWriteMask =
+                VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+
+        VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+        cb.attachmentCount = 1;
+        cb.pAttachments = &attachState;
+        cb.logicOpEnable = VK_FALSE;
+        cb.logicOp = VK_LOGIC_OP_NO_OP;
+        cb.blendConstants[0] = 1.0f;
+        cb.blendConstants[1] = 1.0f;
+        cb.blendConstants[2] = 1.0f;
+        cb.blendConstants[3] = 1.0f;
+
+        VkRect2D scissor = {{0, 0}, {width, height}};
+        // Will invert y after projection
+        VkViewport viewport = {0.0f, 0.0f, (float)width, (float)height, 0.0f, 1.0f};
+        VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+        vp.viewportCount = 1;
+        vp.pViewports = &viewport;
+        vp.scissorCount = 1;
+        vp.pScissors = &scissor;
+
+        VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+        ds.depthTestEnable = VK_TRUE;
+        ds.depthWriteEnable = VK_TRUE;
+        ds.depthCompareOp = VK_COMPARE_OP_LESS;
+        ds.depthBoundsTestEnable = VK_FALSE;
+        ds.stencilTestEnable = VK_FALSE;
+        ds.front.failOp = VK_STENCIL_OP_KEEP;
+        ds.front.passOp = VK_STENCIL_OP_KEEP;
+        ds.front.depthFailOp = VK_STENCIL_OP_KEEP;
+        ds.front.compareOp = VK_COMPARE_OP_ALWAYS;
+        ds.back = ds.front;
+        ds.minDepthBounds = 0.0f;
+        ds.maxDepthBounds = 1.0f;
+
+        VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+        ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+        VkShaderModule vertexShader, fragmentShader;
+        buildShaderFromFile(androidAppCtx, "shaders/tri.vert",
+                            VK_SHADER_STAGE_VERTEX_BIT, mDevice.device_,
+                            &vertexShader);
+        buildShaderFromFile(androidAppCtx, "shaders/tri.frag",
+                            VK_SHADER_STAGE_FRAGMENT_BIT, mDevice.device_,
+                            &fragmentShader);
+        // Specify vertex and fragment shader stages
+        VkPipelineShaderStageCreateInfo shaderStages[2]{
+                {
+                        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                        .pNext = nullptr,
+                        .flags = 0,
+                        .stage = VK_SHADER_STAGE_VERTEX_BIT,
+                        .module = vertexShader,
+                        .pName = "main",
+                        .pSpecializationInfo = nullptr,
+                },
+                {
+                        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                        .pNext = nullptr,
+                        .flags = 0,
+                        .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+                        .module = fragmentShader,
+                        .pName = "main",
+                        .pSpecializationInfo = nullptr,
+                }};
+
+        VkGraphicsPipelineCreateInfo pipeInfo{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+        pipeInfo.stageCount = 2;
+        pipeInfo.pStages = shaderStages;
+        pipeInfo.pVertexInputState = &vi;
+        pipeInfo.pInputAssemblyState = &ia;
+        pipeInfo.pTessellationState = nullptr;
+        pipeInfo.pViewportState = &vp;
+        pipeInfo.pRasterizationState = &rs;
+        pipeInfo.pMultisampleState = &ms;
+        pipeInfo.pDepthStencilState = &ds;
+        pipeInfo.pColorBlendState = &cb;
+        if (dynamicState.dynamicStateCount > 0) {
+          pipeInfo.pDynamicState = &dynamicState;
+        }
+        pipeInfo.layout = layout;
+        pipeInfo.renderPass = renderPass;
+        pipeInfo.subpass = 0;
+        CALL_VK(vkCreateGraphicsPipelines(mDevice.device_, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &pipe));
+        LOGI("complete");
+      }
+      {
+        // Create sampler to sample from the attachment in the fragment shader
+        VkSamplerCreateInfo samplerInfo{};
+        samplerInfo.magFilter = VK_FILTER_LINEAR;
+        samplerInfo.minFilter = VK_FILTER_LINEAR;
+        samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+        samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        samplerInfo.addressModeV = samplerInfo.addressModeU;
+        samplerInfo.addressModeW = samplerInfo.addressModeU;
+        samplerInfo.mipLodBias = 0.0f;
+        samplerInfo.maxAnisotropy = 1.0f;
+        samplerInfo.minLod = 0.0f;
+        samplerInfo.maxLod = 1.0f;
+        samplerInfo.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE;
+        CALL_VK(vkCreateSampler(mDevice.device_, &samplerInfo, nullptr, &sampler));
+      }
+      {
+        descriptorInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        descriptorInfo.imageView = viewColor;
+        descriptorInfo.sampler = sampler;
+      }
+    }
 };
 VulkanDeviceInfo device;
 
@@ -114,8 +558,10 @@ struct VulkanRenderInfo {
 };
 VulkanRenderInfo render;
 
+OffScreen* offscreen;
+
 // Android Native App pointer...
-android_app* androidAppCtx = nullptr;
+
 void setImageLayout(VkCommandBuffer cmdBuffer, VkImage image,
                     VkImageLayout oldImageLayout, VkImageLayout newImageLayout,
                     VkPipelineStageFlags srcStages,
@@ -996,7 +1442,7 @@ VkResult CreateDescriptorSet(void) {
       .dstArrayElement = 0,
       .descriptorCount = TUTORIAL_TEXTURE_COUNT,
       .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-      .pImageInfo = texDsts,
+      .pImageInfo = &offscreen->descriptorInfo,
       .pBufferInfo = nullptr,
       .pTexelBufferView = nullptr};
   vkUpdateDescriptorSets(device.device_, 1, &writeDst, 0, nullptr);
@@ -1077,6 +1523,7 @@ bool InitVulkan(android_app* app) {
   // Create graphics pipeline
   CreateGraphicsPipeline();
 
+  offscreen = new OffScreen(device);
   CreateDescriptorSet();
 
   // -----------------------------------------------
